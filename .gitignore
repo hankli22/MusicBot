@@ -1,0 +1,19 @@
+# Gradle / Loom
+.gradle/
+build/
+run/
+
+# 日志（MusicBot 自己会写 logs/latest.log 的引用，但不是源码）
+logs/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.ipr
+*.iws
+out/
+
+# 系统
+Thumbs.db
+desktop.ini

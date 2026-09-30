@@ -1,0 +1,50 @@
+plugins {
+    id 'fabric-loom' version '1.14.10'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    mavenCentral()
+    maven { url = "https://maven.fabricmc.net/" }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+    // Meteor Client（本地宿主 jar）——本插件唯一的功能依赖
+    modImplementation files('libs/meteor-client-1.21.11-He-20260725.jar')
+
+    // orbit 事件总线（@EventHandler/EventBus）：meteor jar 里它是 jar-in-jar
+    // （META-INF/jars/orbit-0.2.4.jar），不会出现在编译期 classpath 上，所以这里单独给一份。
+    // 运行时由 meteor 自己带进游戏，因此是 compileOnly（别打进本插件的 jar）。
+    compileOnly files('libs/orbit-0.2.4.jar')
+}
+
+// fabric.mod.json 里的 "version" 写成 ${version}，这里把它展开成 gradle.properties 的 mod_version。
+// inputs.property 是必需的：没有它，版本号变了 processResources 仍会判定 UP-TO-DATE，
+// 直接复用上一次展开好的产物，等于没改。
+processResources {
+    filteringCharset "UTF-8"
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+    it.options.encoding = "UTF-8"
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
