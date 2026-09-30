@@ -73,4 +73,5 @@ Minecraft **Meteor Client** 附属插件：给彗星自带的**音符盒机器�
 
 ## 许可
 
-待定（作者保留）。
+**GPL-3.0**（GNU General Public License v3.0）—— 与上游 Meteor Client 一致。
+完整正文见仓库根目录的 `LICENSE`。

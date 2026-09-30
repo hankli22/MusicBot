@@ -20,7 +20,8 @@ dependencies {
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
     // Meteor Client（本地宿主 jar）——本插件唯一的功能依赖
-    modImplementation files('libs/meteor-client-1.21.11-He-20260725.jar')
+    // 换成用户实际在用的本体：meteor-client 1.21.11-86（原 He-20260725 已从 libs/ 移除）
+    modImplementation files('libs/meteor-client-1.21.11-86.jar')
 
     // orbit 事件总线（@EventHandler/EventBus）：meteor jar 里它是 jar-in-jar
     // （META-INF/jars/orbit-0.2.4.jar），不会出现在编译期 classpath 上，所以这里单独给一份。

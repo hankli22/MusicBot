@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "id": "musicbot",
   "version": "${version}",
+	"license": "GPL-3.0",
   "name": "MusicBot",
   "description": "MusicBot：给彗星自带的 Notebot 加播放列表 / 随机不重复 / 分组。播放完全复用 Notebot（loadSong/play/stop/getStatus 都是 public，零反射），本插件只负责「下一首放哪首、什么时候换」；操作面是 .musicbot（别名 .mb），歌曲从 <游戏目录>/meteor-client/notebot/ 里选。",
   "authors": [
