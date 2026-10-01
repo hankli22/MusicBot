@@ -43,6 +43,23 @@ import java.util.List;
  * 就是一首结束了。这是"只用公开入口"的前提下唯一可靠的边界信号——比猜时长可靠，
  * 也不会因为用户在 Notebot GUI 里手点 Pause 而误判（Pause 后状态串仍是 "Playing song."）。
  *
+ * <h3>2026-10-06「长时间运行后卡死」专项加固（改之前先读这段）</h3>
+ * 三条会"一次卡住、之后永久不工作"的路径被补上了兜底，共同原则是
+ * <b>liveness 优先（能自愈） + 每次自愈都留一行 MUSICBOT 日志</b>：
+ * <ol>
+ * <li><b>起播永久等待</b>：Notebot 的 {@code tune()} 只在跑完那一刻调一次 {@code play()}，
+ * 而 {@code play()} 在非生存模式下什么都不做 —— 于是 {@code stage} 停在 Playing、
+ * 状态串恒为 "Ready to play."。原代码只认 "Playing song" 和 "Stage: None"，
+ * 只能靠 10 秒超时脱身；而超时后 Notebot 还在后台接着加载/开播，模块与它对不上号。
+ * 现在：等待期间识别 "Ready to play." → 替它补一次 {@code play()}（{@link #START_RESCUE_TICKS} 时间窗内），
+ * 超时那条路则把 Notebot 一起 {@code stop()} 使两边状态重新对齐。</li>
+ * <li><b>自动下一首断链</b>：{@link #advanceToNext} 唯一依赖"上一 tick 在放、这一 tick 不放"这个边沿，
+ * 而边沿只出现一次。{@code playIndex} 提前 return（文件被删 / 格式变了 / 组过滤）会让链条静默死掉。
+ * 现在：失败要报出"第几首、什么毛病、接下来怎么办"，并计入 {@link #autoAdvanceFailures}。</li>
+ * <li><b>异步搜索单飞闸门卡死</b>：见 {@link MusicBotSearch} 的类注释（代次标记 + 看门狗 + 提交兜底）。</li>
+ * </ol>
+ * 三者的现场都能在 {@link #diagnose()} 那一行里看到（界面底部 + {@code .musicbot status}）。
+ *
  * <h3>已知取舍（写在这里免得下次又踩）</h3>
  * <ul>
  * <li>切歌时旧歌是"戛然而止"——Notebot 没有淡出，{@code loadSong} 直接 resetVariables。
@@ -140,6 +157,15 @@ public class MusicBot extends Module {
     /** 发出播放指令后最多等多少 tick（20t = 1 秒）还没起播就放弃。彗星内部加载超时是 60 秒，那个太久了。 */
     private static final int START_TIMEOUT_TICKS = 200;
 
+    /**
+     * 发出 loadSong 之后、允许我们自己去补一刀 {@code Notebot.play()} 的时间窗（tick）。
+     *
+     * <p>让补刀只在"刚发出指令的头几秒"里发生：过了这个窗口就不再动 Notebot ——
+     * 用户可能已经自己手动暂停/操作过了，模块不该在几十秒后突然去改他的状态。
+     * 补刀逻辑在 {@link #onTick} 的 {@code waitingForStart} 分支里（认 "Ready to play." 那一条）。
+     */
+    private static final int START_RESCUE_TICKS = 100;
+
     /** 下一首要放的下标；-1 = 没在放。 */
     private int currentIndex = -1;
 
@@ -158,6 +184,38 @@ public class MusicBot extends Module {
     /** 通知气泡最多这么频繁地弹一次（tick 计），免得 Notebot 没调好时刷屏。 */
     private int lastWarnTick = -100;
     private int tick;
+
+    /**
+     * 上一次"排队提示"的内容与它出现的 tick（{@link #notifyThrottled} 用）。
+     *
+     * <p>为什么不复用 {@link #lastWarnTick}：那个是"按时间限流"（3 秒内任何提示都弹不出来），
+     * 于是"队列满了丢操作"这种一次性事件只要和别的提示撞在 3 秒内就会被彻底吃掉——
+     * 用户只看到点了没反应，聊天栏里一个字都没有。<b>会丢用户操作的事必须说出来</b>，
+     * 所以这里按"内容"去重（同一句话 3 秒内不重复弹），而不是"任何话 3 秒内只弹一次"。
+     */
+    private String lastNotifyMsg;
+    private int lastNotifyTick = -100;
+
+    /**
+     * 自动下一首连续失败了几次（{@link #advanceToNext} 里 loadSong 没生效）。
+     *
+     * <p>只用来决定"这一条提示要不要再弹一次"：一首坏歌连续跳过 3 次之后就把提示降级成日志，
+     * 免得一屏坏歌把聊天栏刷爆。真正播起来（{@link #onTick} 的起播成功分支）会清零。
+     */
+    private int autoAdvanceFailures;
+
+    /**
+     * 这一个"开启周期"里 {@link #onActivate} 有没有跑过完整初始化。
+     *
+     * <p>为什么要单独一个字段而不是复用 {@link #tick}：tick 只在 onActivate 里归零，看起来能当
+     * "刚开过"的标记，但它只在玩家在世界里时才自增 —— 而重复 onActivate 恰恰可能发生在
+     * "开了模块但还没有 tick 跑过"的时候，那时两者都是 0，护栏方向就反了（会挡住该跑的初始化）。
+     * 用一个只表达一件事的字段，别让两件事共用一个变量。
+     *
+     * <p>重置点：{@link #onDeactivate}。这样"世界里开→关→再开"仍然会重新初始化
+     * （stop、重置随机状态、重新提扫描请求），而同一周期里的重复 onActivate 被挡住。
+     */
+    private boolean activated;
 
     // ================================================================ 设置
 
@@ -273,11 +331,31 @@ public class MusicBot extends Module {
     @Override
     public void onActivate() {
         super.onActivate();
+
+        // 重复 onActivate 的护栏（2026-10-06 加）。
+        //
+        // 依据（反编译 1.21.11-86 核实）：
+        //   · Module.toggle()  只在 canUpdate() 为真时才会 subscribe + onActivate；
+        //   · Modules.onGameJoined() 会**无条件**对所有 isActive() 的模块再 subscribe 一次 + onActivate 一次
+        //     （它不检查"是不是已经订阅过了"）；
+        //   · Orbit 的 EventBus.subscribe(Object) 也不去重：listenerCache.computeIfAbsent 之后
+        //     直接 insert(listenerMap, listener)，同一个对象再 subscribe 一次就是同一批监听器进列表两次。
+        // 于是"先在世界里开了模块、再触发一次 GameJoinedEvent"这种组合会让 onTick/onTickQueue
+        // 每个 tick 各跑两遍：Op 队列一轮最多执行 MAX_QUEUE 条（体感是"点一下做了两次"），
+        // tick 计数和限流也跟着翻倍。这里挡住重复初始化。
+        //
+        // 顺序很关键：真正的初始化必须放在这个 return **之前**。否则会出现
+        // "toggle() 只标了 active、没调 onActivate（主菜单里开模块），随后 GameJoinedEvent 到达时
+        // 被这个 return 挡掉" —— 那才是真正的永久不工作，比重复订阅严重得多。
+        if (activated) return;
+        activated = true;
+
         tick = 0;
         lastWarnTick = -100;
         notebotWasPlaying = false;
         waitingForStart = false;
         currentIndex = -1;
+        autoAdvanceFailures = 0;
         store.resetShuffleState();
 
         if (!store.isLoaded()) store.load();
@@ -311,6 +389,7 @@ public class MusicBot extends Module {
     @Override
     public void onDeactivate() {
         super.onDeactivate();
+        activated = false;   // 下一次 onActivate 要重新跑完整初始化
         // 关模块 = 停播 + 落盘。不落盘的话"改完列表直接关模块"这条最常见的路径会丢数据。
         if (waitingForStart || currentIndex >= 0) {
             stopNotebot(false);
@@ -345,10 +424,31 @@ public class MusicBot extends Module {
             waitTicks++;
             if (nowPlaying) {
                 waitingForStart = false;
+                autoAdvanceFailures = 0;
                 store.recordPlayed(currentIndex);
                 store.commitShuffleDraw(currentIndex);
                 if (logEachSong.get()) {
                     Alog("开始播放 #" + (currentIndex + 1) + " " + describe(currentIndex));
+                }
+            } else if (isNotebotReadyToPlay(notebot.getStatus())) {
+                // ---- 起播救助（2026-10-06 加）----
+                // "Ready to play." = stage 已经是 Playing、song 已经加载好，只是 isPlaying 还是 false。
+                // Notebot 自己只在 tune() 跑完那一刻调一次 play()；如果那一刻玩家不在生存模式，
+                // play() 只会打一句 "You need to be in survival mode." 然后什么都不做，
+                // 而 stage 会永远停在 Playing —— 于是 waitingForStart 一直挂到 10 秒超时，
+                // 用户看到的是"点了播放，等 10 秒，提示超时，然后就没反应了"。
+                // 这里补一刀：状态说"准备好了"，我们就替它按一次播放键（生存模式下这是无副作用的；
+                // 仍然不在生存模式的话 Notebot 会自己再报一次，我们照旧走"加载失败"那条路）。
+                boolean rescued = false;
+                try {
+                    notebot.play();
+                    rescued = true;
+                } catch (Throwable t) {
+                    Alog("起播救助失败：" + t);
+                }
+                if (rescued) {
+                    Alog("起播救助：Notebot 已 Ready 但一直没开播，已替它调用 play()（第 "
+                        + (currentIndex + 1) + " 首，等了 " + waitTicks + " tick）");
                 }
             } else if (notebot.getStatus().startsWith("Stage: None")) {
                 // 加载失败/被取消：Notebot 会把 stage 打回 None。**不在这里自动跳下一首**——
@@ -360,11 +460,26 @@ public class MusicBot extends Module {
                 Alog("加载失败，停下");
             } else if (waitTicks > START_TIMEOUT_TICKS) {
                 // 兜底：状态串既不是"在放"也不是"Stage: None"（比如彗星改了状态文案）。
-                // 没有这个超时的话 waitingForStart 会永远挂着，整个自动下一首链路静默死掉。
+                //
+                // 2026-10-06 改：这里原来只清掉 waitingForStart + currentIndex 就结束，
+                // 于是留下一个"用户看不见的状态错位"：
+                //   · Notebot 还在后台接着加载（它自己的超时是 60 秒），十几秒后它真的开播了；
+                //   · 但模块这边已经不认这首了（currentIndex = -1），用户按「播放」会被
+                //     Op.PlayAll 的"已经在放就别重头开始"挡掉，什么都不发生 —— 也就是报告里
+                //     "界面点了没反应"的一种；
+                //   · 等这首歌放完，边沿检测会拿 currentIndex = -1 去挑下一首，结果是列表第一首，
+                //     整个顺序播放就此错位。
+                // 现在还是放弃这一首（不强行改用户的队列），但**把 Notebot 也一起停干净**，
+                // 让"模块的认知"和"Notebot 的实际状态"重新对齐；用户再按播放就是从干净状态开始。
                 waitingForStart = false;
+                int abandoned = currentIndex;
                 currentIndex = -1;
-                warnThrottled("等 Notebot 起播超时（10 秒），已放弃这一首。当前 Notebot 状态：" + notebot.getStatus());
-                Alog("起播超时，status=" + notebot.getStatus());
+                String status = notebot.getStatus();
+                stopNotebot(false);
+                warnThrottled("等 Notebot 起播超时（" + (START_TIMEOUT_TICKS / 20) + " 秒），已放弃第 "
+                    + (abandoned + 1) + " 首并把 Notebot 停干净。当前 Notebot 状态：" + status);
+                Alog("起播超时，放弃 #" + (abandoned + 1) + "，status=" + status
+                    + "（已 stop 使状态对齐，等待原因多半是状态串没匹配上或超大文件加载慢）");
             }
             notebotWasPlaying = nowPlaying;
             lastNotebotStatus = notebot.getStatus();
@@ -401,7 +516,55 @@ public class MusicBot extends Module {
             Alog("一轮结束，停下");
             return;
         }
+
+        // 起点（用于判断 playIndex 到底有没有把这首推上去）。
+        //
+        // 2026-10-06 加：advanceToNext 的调用点只有一处（上一 tick 还在放、这一 tick 不放了），
+        // 而那个边沿**只会出现一次**。如果 playIndex 因为"文件在扫描之后被删/被改成不认识的格式/
+        // 列表被命令改了"而提前 return，不但自动下一首静默断掉，而且连一句"为什么"都没有：
+        //   下一 tick nowPlaying 仍然是 false，下降沿永远不会再来 → 播放彻底停住，用户只看到歌没了。
+        // 这里把它变成"看得见"的：失败要说清是哪一首、什么毛病，并且计数（连续 3 次降级成日志）。
+        int before = currentIndex;
         playIndex(next, false);
+        if (currentIndex == before) {
+            autoAdvanceFailures++;
+            String why = explainUnplayable(next);
+            if (autoAdvanceFailures <= 3) {
+                warning("MusicBot 自动下一首没放起来：第 %d 首 %s。后面的歌不会自己接上了，"
+                    + "用「下一首」或 .musicbot next 继续。%s", next + 1, why, advanceStalledHint());
+            }
+            Alog("自动下一首失败 #" + autoAdvanceFailures + "：第 " + (next + 1) + " 首 " + why
+                + "（currentIndex 仍是 " + currentIndex + "，自动推进已停住）");
+        } else {
+            autoAdvanceFailures = 0;
+        }
+    }
+
+    /**
+     * 第 index 首"放不起来"的原因（给用户看的一句话）。
+     *
+     * <p>只解释、不修：{@link #playIndex} 的判定顺序是"文件在不在 → 格式认不认识 → 组过滤"，
+     * 这里按同一个顺序给出第一个不满足的条件，保证提示和实际拦截点一致。
+     */
+    private String explainUnplayable(int index) {
+        SongEntry entry = store.entryAt(index);
+        File file = store.resolveAt(index);
+        if (file == null || !file.isFile()) {
+            return "找不到文件（" + (entry == null ? "?" : entry.relative()) + "）";
+        }
+        if (!SongDecoders.hasDecoder(file)) {
+            return "格式 Notebot 不认识：" + file.getName();
+        }
+        if (onlyThisGroup.get() && !groupMatches(entry)) {
+            return "不在当前只播的组「" + currentGroup() + "」里";
+        }
+        return "原因不明（看 MUSICBOT 调试日志）";
+    }
+
+    /** 自动推进停住之后，用户接下来该怎么办——写成一句人话，别让他猜。 */
+    private String advanceStalledHint() {
+        return "文件被删或改名时，列表里那条不会自动剔除（这是有意的），"
+            + "用 .musicbot remove 清掉它，或把文件放回 notebot 目录后再 .musicbot refresh。";
     }
 
     private String describeEndReason() {
@@ -743,6 +906,88 @@ public class MusicBot extends Module {
         return notebot == null ? "找不到 Notebot 模块" : notebot.getStatus();
     }
 
+    // ================================================================ 自检（"是不是卡住了"一眼看）
+
+    /** 操作队列里还堆着几条没执行（上限 {@link #MAX_QUEUE}）。 */
+    public int queueSize() {
+        return queue.size();
+    }
+
+    /** 操作队列上限（自检行显示 N/M 里的 M）。 */
+    public int queueLimit() {
+        return MAX_QUEUE;
+    }
+
+    /** 后台搜索现在的状态（含"已经跑了多久"，卡死时一眼能看出来）。 */
+    public MusicBotSearch.State searchState() {
+        return search.state();
+    }
+
+    /** 后台搜索已经跑了多少毫秒；不在跑时是 0。 */
+    public long searchRunningMillis() {
+        return search.runningMillis();
+    }
+
+    /** 自动下一首连续失败了几次（0 = 正常）。 */
+    public int autoAdvanceFailures() {
+        return autoAdvanceFailures;
+    }
+
+    /**
+     * 自检行：把"会卡住的那些状态位"压成一行短字符串，界面底部和 {@code .musicbot status} 共用。
+     *
+     * <p>设计目标只有一个：用户下次说"又卡了"的时候，**截图这一行就够了**，不用再来回猜。
+     * 每个字段都对应报告里一条具体的卡死路径：
+     * <ul>
+     * <li>{@code wait=}   起播等待；真值 = 模块正在等 Notebot 起播（带已等 tick 数，超过 ~200t 就是超时兜底在跑）。</li>
+     * <li>{@code queue=}  操作队列 N/M；N 长期不为 0 = 队列没被 drain（玩家不在世界 / 模块没真激活）。</li>
+     * <li>{@code search=} 后台搜索状态 + 已跑毫秒；{@code RUNNING(20000ms+)} = 单飞闸门卡死那一条。</li>
+     * <li>{@code idx=}    当前曲目序号 i/N（0 = 没在放）；为 0 而 {@code np=playing} = 状态错位。</li>
+     * <li>{@code fail=}   自动下一首连续失败次数；非 0 = "歌停了、后面没接上"。</li>
+     * <li>{@code np=}     Notebot 侧：playing / ready（加载好了但没开播）/ idle。</li>
+     * </ul>
+     */
+    public String diagnose() {
+        Notebot notebot = notebot();
+        String np;
+        if (notebot == null) {
+            np = "无Notebot";
+        } else {
+            String st = notebot.getStatus();
+            np = isNotebotPlaying(st) ? "playing" : isNotebotReadyToPlay(st) ? "ready" : "idle";
+        }
+        return "wait=" + (waitingForStart ? ("是(" + waitTicks + "t)") : "否")
+            + "  queue=" + queue.size() + "/" + MAX_QUEUE
+            + "  search=" + searchLabel()
+            + "  idx=" + (currentIndex + 1) + "/" + store.size()
+            + "  fail=" + autoAdvanceFailures
+            + "  np=" + np
+            + "  mode=" + playMode.get();
+    }
+
+    /** {@code search=} 那一段：状态名 + 已跑时长 + 失败原因摘要。 */
+    private String searchLabel() {
+        MusicBotSearch.State s = search.state();
+        StringBuilder sb = new StringBuilder(s.name());
+        if (s == MusicBotSearch.State.RUNNING) {
+            long ms = search.runningMillis();
+            sb.append('(').append(ms).append("ms");
+            if (ms > MusicBotSearch.watchdogMillis()) sb.append(" 超过看门狗");
+            sb.append(')');
+        }
+        String err = search.lastAppliedError();
+        if (s == MusicBotSearch.State.FAILED && err != null) {
+            sb.append(" \"").append(shorten(err, 60)).append('"');
+        }
+        return sb.toString();
+    }
+
+    /** 截断到 max 个字符（只影响自检显示）。 */
+    private static String shorten(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "…";
+    }
+
     /** 按当前设置同步一次"是否只播这个组"，并给出给用户看的说明。 */
     public String describeFilter() {
         if (!isGroupFilterOn()) return "组过滤：关（全部列表参与）";
@@ -826,10 +1071,37 @@ public class MusicBot extends Module {
 
     private void enqueue(Op op) {
         if (queue.size() >= MAX_QUEUE) {
-            Alog("操作队列已满（" + MAX_QUEUE + "），丢弃：" + op);
+            // 2026-10-06 改：原来这里只有一行 Alog，用户那边是**完全静默**的——
+            // 点「播放」没反应、聊天栏一个字都没有，正是报告里"界面点了没反应"最难查的一种。
+            // 丢操作必须让用户知道（队列满本身几乎只可能发生在"玩家不在世界里"的时候，
+            // 因为 drainQueue 每个 tick 都会清空它；见 drainQueue 的 early return）。
+            Alog("操作队列已满（" + MAX_QUEUE + "），丢弃：" + op
+                + "（模块 active=" + isActive() + "，玩家在上世界=" + (mc.player != null && mc.world != null) + "）");
+            notifyThrottled("操作队列满了（" + MAX_QUEUE + " 条没执行完），这次「" + opName(op)
+                + "」没生效。队列要等玩家进入世界才会执行——回到游戏里再点一次；"
+                + "一直这样就用 .musicbot status 看自检行。");
             return;
         }
         queue.addLast(op);
+    }
+
+    /** 给用户看的操作名（用在"队列满、这次没生效"那句提示里）。 */
+    private static String opName(Op op) {
+        return switch (op) {
+            case Op.PlayAll ignored -> "播放";
+            case Op.Pause ignored -> "暂停/继续";
+            case Op.Stop ignored -> "停止";
+            case Op.Next ignored -> "下一首";
+            case Op.Prev ignored -> "上一首";
+            case Op.PlayIndex p -> "播放第 " + (p.index() + 1) + " 首";
+            case Op.AddSong a -> "加入「" + a.query() + "」";
+            case Op.RemoveSong r -> "移除「" + r.query() + "」";
+            case Op.MoveSong m -> "移动「" + m.query() + "」";
+            case Op.RemoveAt r -> "移除第 " + (r.index() + 1) + " 首";
+            case Op.MoveAt m -> "移动第 " + (m.index() + 1) + " 首";
+            case Op.SetGroupAt g -> "给第 " + (g.index() + 1) + " 首打组";
+            case Op.ClearList ignored -> "清空列表";
+        };
     }
 
     /**
@@ -1086,9 +1358,20 @@ public class MusicBot extends Module {
         }
     }
 
-    /** 状态串是不是"正在放歌"。Notebot.getStatus() 的原文见 Notebot.java:605。 */
+    /** 状态串是不是"正在放歌"。Notebot.getStatus() 的原文见 Notebot.java:443-460。 */
     private static boolean isNotebotPlaying(String status) {
         return status != null && status.startsWith("Playing song");
+    }
+
+    /**
+     * 状态串是不是"歌已加载好、就等一个 play()"。
+     *
+     * <p>{@code Notebot.getStatus()} 在 {@code stage == Playing && !isPlaying} 时返回
+     * {@code "Ready to play."}（反编译 1.21.11-86 核实，见报告）。这正是
+     * {@link #waitingForStart} 会永久挂住的唯一静止态，所以 {@link #onTick} 里专门认它。
+     */
+    private static boolean isNotebotReadyToPlay(String status) {
+        return status != null && status.startsWith("Ready to play");
     }
 
     /** 组过滤开着时，这条属不属于当前组。 */
@@ -1105,6 +1388,24 @@ public class MusicBot extends Module {
             return;
         }
         lastWarnTick = tick;
+        warning(msg);
+    }
+
+    /**
+     * 按"内容"限流的提示：同一句话 3 秒内不重复弹，但**不同的话互不影响**。
+     *
+     * <p>和 {@link #warnThrottled} 的区别很关键：那个是"3 秒内任何提示都不许再弹"，
+     * 于是一次性事件（比如"队列满了、你这次点击没生效"）只要撞上别的提示就会被彻底吃掉，
+     * 用户看到的就是"点了没反应、聊天栏也没说为什么"。会丢用户操作的事必须说出来，所以单开一条通道。
+     */
+    private void notifyThrottled(String msg) {
+        if (msg.equals(lastNotifyMsg) && tick - lastNotifyTick < 60) {
+            Alog("(同类提示限流未显示) " + msg);
+            return;
+        }
+        lastNotifyMsg = msg;
+        lastNotifyTick = tick;
+        Alog(msg);     // 聊天栏会限流，日志不限流：下次真出问题，日志里要有完整的时间线
         warning(msg);
     }
 

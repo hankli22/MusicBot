@@ -247,6 +247,11 @@ public class MusicBotCommand extends Command {
         } else {
             info("当前：#%d %s%s", m.currentNumber(), cur, m.isWaitingForStart() ? "（正在加载…）" : "");
         }
+
+        // 自检段（2026-10-06 加）：专门为"长时间运行后卡死"准备的出口。
+        // 用户说"又卡了"时，把下面两行截图/复制出来就能定位，不用再来回猜。
+        info("自检：%s", m.diagnose());
+        info("自检：Notebot 原始状态串：%s", m.notebotStatus());
         return SINGLE_SUCCESS;
     }
 

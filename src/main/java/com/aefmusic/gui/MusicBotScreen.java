@@ -69,6 +69,7 @@ public class MusicBotScreen extends WindowScreen {
     private WLabel nowLabel;
     private WLabel filterLabel;
     private WLabel statusLabel;
+    private WLabel checkLabel;
     private WLabel addHintLabel;
 
     // ---- 需要整体重建的表格 ----
@@ -189,6 +190,9 @@ public class MusicBotScreen extends WindowScreen {
         // ---------------------------------------------------------- 底部：Notebot 原始状态
         add(theme.horizontalSeparator());
         statusLabel = add(theme.label("")).expandX().widget();
+        // 自检行（"是不是卡住了"一眼看）：这一行是这一版专门给"又卡了"准备的出口，
+        // 用户截图这一行就能定位，不用再来回猜。字段含义见 MusicBot.diagnose() 的注释。
+        checkLabel = add(theme.label("")).expandX().widget();
 
         // 首次进屏就把内容填上（onRenderBefore 也会兜底重建，这里只是省掉第一帧的空屏）
         rebuildSongRows();
@@ -308,6 +312,15 @@ public class MusicBotScreen extends WindowScreen {
             // 「一首放完」的判定就靠这个字符串：原样亮出来，出问题时一眼能看到卡在哪一步
             statusLabel.set("Notebot 原始状态：" + module.notebotStatus());
         }
+
+        if (checkLabel != null) {
+            // 自检行：每帧都要重算 —— 它显示的正是"随时间变化才会暴露"的那几个量
+            // （等待 tick 数、搜索已跑毫秒数），缓存住就失去意义了。
+            // 开销：几次 int/boolean 读取 + 一次 Notebot.getStatus()，和上面的状态行同量级。
+            checkLabel.set("自检：" + module.diagnose()
+                + "　（卡住时把这行截给我：wait 一直涨、queue 不为 0、search 超过看门狗、"
+                + "fail 不为 0 就是卡点）");
+        }
     }
 
     /**
@@ -325,6 +338,7 @@ public class MusicBotScreen extends WindowScreen {
         }
         h = h * 31 + module.currentNumber();
         h = h * 31 + (module.isWaitingForStart() ? 1 : 0);
+        h = h * 31 + module.autoAdvanceFailures();
         h = h * 31 + (module.isGroupFilterOn() ? 1 : 0);
         h = h * 31 + module.currentGroup().hashCode();
         return h;

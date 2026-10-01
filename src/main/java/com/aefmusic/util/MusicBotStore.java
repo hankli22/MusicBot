@@ -418,7 +418,14 @@ public final class MusicBotStore {
             Collections.unmodifiableList(new ArrayList<>(matches)));
     }
 
-    private static ScanResult failure(String query, String message) {
+    /**
+     * 造一个"失败"结果。
+     *
+     * <p><b>为什么是 public</b>：{@link MusicBotSearch#start} 里那个后台 lambda 必须保证
+     * "无论如何都要往信箱里放一个结果"——它是单飞闸门唯一的开门钥匙。所以 scan 抛出去的任何东西
+     * 都要能在 lambda 里就地转成一个失败结果，而那个 lambda 在另一个包里，拿不到这个私有工厂。
+     */
+    public static ScanResult failure(String query, String message) {
         return new ScanResult(query, message, Map.of(), Map.of(), Map.of(), List.of());
     }
 
